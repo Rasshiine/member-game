@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>メンバー覚えゲーム 回答</title>
+<!--
+  スマホ用の回答ページです。写真やメンバー名はこのファイルには入っていません。
+  投影用PCとインターネット経由で直接つながり（PeerJS / WebRTC）、選択肢の名前と回答だけをやりとりします。
+-->
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+:root{--bg:#14161b;--card:#1f232b;--ink:#f2f4f7;--sub:#9aa3ae;--line:#323844;
+  --c0:#e5484d;--c1:#2f6fec;--c2:#e5a50a;--c3:#2fa36b;--c4:#9b59d0;--c5:#e0663a;--ok:#2fa36b;--ng:#e5484d}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font-family:"Hiragino Sans","Noto Sans JP","Yu Gothic",Meiryo,sans-serif}
+body{display:flex;flex-direction:column;min-height:100dvh}
+.top{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;font-size:14px;color:var(--sub);border-bottom:1px solid var(--line)}
+.top b{color:var(--ink)}
+main{flex:1;display:flex;flex-direction:column;justify-content:center;padding:16px;gap:14px}
+.hidden{display:none!important}
+h1{font-size:22px;margin:0 0 4px;text-align:center}
+.center{text-align:center}
+.muted{color:var(--sub);font-size:14px}
+input{font:inherit;font-size:20px;width:100%;padding:14px;border-radius:12px;border:2px solid var(--line);background:var(--card);color:var(--ink)}
+.btn{font:inherit;font-size:20px;font-weight:800;width:100%;padding:16px;border-radius:14px;border:none;background:var(--c1);color:#fff}
+.btn:disabled{opacity:.4}
+.choices{display:grid;gap:10px;flex:1;grid-template-rows:repeat(var(--rows,4),1fr)}
+.choices button{font:inherit;color:#fff;border:none;border-radius:16px;font-size:24px;font-weight:800;display:flex;align-items:center;gap:14px;padding:0 18px;min-height:64px;text-align:left}
+.choices button .l{font-size:30px;width:36px;flex:none;text-align:center}
+.choices button:active{transform:scale(.98)}
+.choices.done button{opacity:.3}
+.choices.done button.mine{opacity:1;outline:4px solid #fff}
+.big{font-size:56px;font-weight:900;text-align:center;line-height:1.2}
+.res-ok{color:var(--ok)} .res-ng{color:var(--ng)}
+.timer{height:8px;background:var(--line);border-radius:9px;overflow:hidden}
+.timer>div{height:100%;background:var(--ink);width:100%}
+.err{color:var(--ng);font-size:14px;text-align:center;min-height:20px}
+</style>
+</head>
+<body>
+<div class="top"><span id="tName">メンバー覚えゲーム</span><span id="tScore"></span></div>
+<main>
+  <!-- 参加 -->
+  <section id="sJoin">
+    <h1>メンバー覚えゲーム</h1>
+    <p class="muted center">ニックネームを入れて参加してください</p>
+    <input id="room" inputmode="numeric" placeholder="部屋番号（6けた）" maxlength="6" style="margin-bottom:10px">
+    <input id="name" placeholder="ニックネーム" maxlength="12" autocomplete="nickname">
+    <p class="err" id="err"></p>
+    <button class="btn" id="joinBtn">参加する</button>
+  </section>
+
+  <!-- 待機 -->
+  <section id="sWait" class="hidden center">
+    <div class="big" style="font-size:40px" id="waitTitle">参加しました！</div>
+    <p class="muted" id="waitMsg">スクリーンを見て、問題が始まるのを待ってね</p>
+  </section>
+
+  <!-- 問題 -->
+  <section id="sQ" class="hidden" style="display:flex;flex-direction:column;gap:12px;flex:1">
+    <div class="center muted" id="qInfo"></div>
+    <div class="timer"><div id="timerBar"></div></div>
+    <div class="choices" id="choices"></div>
+  </section>
+
+  <!-- 結果 -->
+  <section id="sRes" class="hidden center">
+    <div class="big" id="resBig"></div>
+    <p style="font-size:22px;font-weight:700;margin:8px 0" id="resPts"></p>
+    <p class="muted" id="resRank"></p>
+  </section>
+</main>
+
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const COLORS = ['var(--c0)','var(--c1)','var(--c2)','var(--c3)','var(--c4)','var(--c5)'];
+const LABELS = ['A','B','C','D','E','F'];
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch { return null; } },
+  set(k,v){ try { localStorage.setItem(k,v); } catch {} }
+};
+const params = new URLSearchParams(location.search);
+$('room').value = params.get('r') || '';
+if (params.get('r')) $('room').classList.add('hidden');
+$('name').value = store.get('mg_name') || '';
+let token = store.get('mg_token');
+if (!token) { token = Math.random().toString(36).slice(2) + Date.now().toString(36); store.set('mg_token', token); }
+
+let peer = null, conn = null, myName = '', room = '', curQ = null, timerRaf = 0, joined = false;
+
+function show(id){ ['sJoin','sWait','sQ','sRes'].forEach(s => $(s).classList.toggle('hidden', s !== id)); }
+
+$('joinBtn').onclick = join;
+$('name').addEventListener('keydown', e => { if (e.key === 'Enter') join(); });
+
+function join() {
+  myName = $('name').value.trim();
+  room = $('room').value.trim();
+  if (!/^\d{6}$/.test(room)) { $('err').textContent = '部屋番号（6けたの数字）を入れてください'; return; }
+  if (!myName) { $('err').textContent = 'ニックネームを入れてください'; return; }
+  store.set('mg_name', myName);
+  $('err').textContent = '接続中…'; $('joinBtn').disabled = true;
+  connect();
+}
+
+function connect() {
+  if (!peer || peer.destroyed) {
+    peer = new Peer();
+    peer.on('open', openConn);
+    peer.on('error', e => {
+      if (e.type === 'peer-unavailable') fail('部屋が見つかりません。部屋番号を確認してください');
+      else if (!joined) fail('接続できませんでした（' + e.type + '）');
+      else retrySoon();
+    });
+    peer.on('disconnected', () => { try { peer.reconnect(); } catch {} });
+  } else openConn();
+}
+function openConn() {
+  conn = peer.connect('lit-member-game-' + room, { reliable: true });
+  conn.on('open', () => conn.send({ t: 'join', name: myName, token }));
+  conn.on('data', onData);
+  conn.on('close', retrySoon);
+  conn.on('error', retrySoon);
+}
+let retryT = 0;
+function retrySoon() {
+  if (!joined || retryT) return;
+  $('tScore').textContent = '再接続中…';
+  retryT = setTimeout(() => { retryT = 0; connect(); }, 1500);
+}
+function fail(msg) { $('err').textContent = msg; $('joinBtn').disabled = false; }
+
+// 同じ部屋に参加したことがあれば（ページの再読み込み・画面ロック後など）自動で入り直す
+if ($('room').value && $('room').value === store.get('mg_room') && $('name').value) join();
+
+function onData(m) {
+  if (m.t === 'welcome') {
+    joined = true;
+    store.set('mg_room', room);
+    myName = m.name;
+    $('tName').innerHTML = '<b></b>'; $('tName').firstChild.textContent = myName;
+    setScore(m.score);
+    if (m.state === 'question' && m.q) onQuestion(m.q, m.answered);
+    else { $('waitTitle').textContent = '参加しました！'; $('waitMsg').textContent = 'スクリーンを見て、問題が始まるのを待ってね'; show('sWait'); }
+  } else if (m.t === 'reject') {
+    fail(m.msg);
+  } else if (m.t === 'question') onQuestion(m.q, null);
+  else if (m.t === 'reveal') onReveal(m);
+  else if (m.t === 'wait') { $('waitTitle').textContent = m.title || 'ちょっと待ってね'; $('waitMsg').textContent = m.msg || 'スクリーンを見てね'; show('sWait'); }
+  else if (m.t === 'final') {
+    $('resBig').textContent = m.rank + '位';
+    $('resBig').className = 'big';
+    $('resPts').textContent = m.score + ' 点';
+    $('resRank').textContent = '参加者 ' + m.total + '人中　おつかれさまでした！';
+    show('sRes');
+  }
+}
+function setScore(s){ $('tScore').textContent = (s || 0) + ' 点'; }
+
+function onQuestion(q, answered) {
+  curQ = q;
+  $('qInfo').textContent = `第${q.no}問 / ${q.total}問　` + (q.prompt || '');
+  const ch = $('choices');
+  ch.className = 'choices';
+  ch.style.setProperty('--rows', q.options.length);
+  ch.innerHTML = '';
+  q.options.forEach((label, i) => {
+    const b = document.createElement('button');
+    b.style.background = COLORS[i];
+    b.innerHTML = '<span class="l">' + LABELS[i] + '</span><span class="n"></span>';
+    b.querySelector('.n').textContent = label || '';
+    b.onclick = () => answer(i);
+    ch.appendChild(b);
+  });
+  show('sQ');
+  if (answered != null) markAnswered(answered);
+  // 残り時間バー（投影PCの時計基準の残りミリ秒で動かす）
+  cancelAnimationFrame(timerRaf);
+  const end = performance.now() + q.remainMs;
+  const tick = () => {
+    const left = Math.max(0, end - performance.now());
+    $('timerBar').style.width = (left / q.limitMs * 100) + '%';
+    if (left > 0) timerRaf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+function answer(i) {
+  if (!curQ || $('choices').classList.contains('done')) return;
+  conn && conn.open && conn.send({ t: 'answer', qid: curQ.qid, choice: i });
+  markAnswered(i);
+  if (navigator.vibrate) navigator.vibrate(30);
+}
+function markAnswered(i) {
+  $('choices').classList.add('done');
+  const b = $('choices').children[i]; if (b) b.classList.add('mine');
+  $('qInfo').textContent = '回答しました！ スクリーンを見て待ってね';
+}
+function onReveal(m) {
+  cancelAnimationFrame(timerRaf);
+  const big = $('resBig');
+  if (m.choice == null) { big.textContent = '時間切れ'; big.className = 'big res-ng'; }
+  else if (m.ok) { big.textContent = '⭕ 正解！'; big.className = 'big res-ok'; }
+  else { big.textContent = '❌ ざんねん'; big.className = 'big res-ng'; }
+  $('resPts').textContent = m.ok ? `+${m.points} 点` : '正解は ' + LABELS[m.correct] + (m.correctLabel ? '「' + m.correctLabel + '」' : '');
+  $('resRank').textContent = `いま ${m.rank}位（${m.total}人中）　合計 ${m.score}点`;
+  setScore(m.score);
+  show('sRes');
+}
+})();
+</script>
+</body>
+</html>
